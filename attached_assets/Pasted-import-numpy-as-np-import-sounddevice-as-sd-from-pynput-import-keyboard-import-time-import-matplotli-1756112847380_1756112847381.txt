@@ -1,0 +1,176 @@
+import numpy as np
+import sounddevice as sd
+from pynput import keyboard
+import time
+import matplotlib.pyplot as plt
+import threading
+
+# -------- Global Parameters (kept same as your original code) --------
+left_freq = 1000      # fixed frequency for left channel
+right_freq = 1000     # start frequency for right channel (variable)
+phase_deg = 0
+running = True
+play_sound = False
+sample_rate = 44100
+
+# -------- Circular buffer for plotting (thread-safe) --------
+# size should be large enough to provide persistence/density similar to DSO
+BUF_SIZE = 65536
+circ_buf = np.zeros((BUF_SIZE, 2), dtype=np.float32)
+write_idx = 0
+buf_filled = False
+buf_lock = threading.Lock()
+
+# -------- Generate Lissajous Wave (unchanged) --------
+def lissajous_wave(t):
+    if not play_sound:
+        return np.zeros((len(t), 2), dtype=np.float32)  # silence
+    left  = np.sin(2*np.pi*left_freq*t + np.deg2rad(phase_deg))   # fixed
+    right = np.sin(2*np.pi*right_freq*t)                          # variable
+    return np.column_stack((left, right)).astype(np.float32)
+
+# -------- Audio Callback (adds writing into circular buffer) --------
+def audio_callback(outdata, frames, time_info, status):
+    global write_idx, buf_filled
+    if status:
+        print("⚠", status)
+    t = (np.arange(frames) + audio_callback.frame) / sample_rate
+    wave = lissajous_wave(t)
+    outdata[:] = wave
+    audio_callback.frame += frames
+
+    # write wave into circular buffer (oldest->newest order maintained)
+    with buf_lock:
+        end = write_idx + frames
+        if end <= BUF_SIZE:
+            circ_buf[write_idx:end, :] = wave
+        else:
+            first = BUF_SIZE - write_idx
+            circ_buf[write_idx:BUF_SIZE, :] = wave[:first, :]
+            circ_buf[0:end % BUF_SIZE, :] = wave[first:, :]
+        write_idx = end % BUF_SIZE
+        if write_idx == 0:
+            buf_filled = True
+
+audio_callback.frame = 0
+
+# -------- Keyboard Control (kept same behaviour) --------
+def on_press(key):
+    global left_freq, right_freq, phase_deg, running, play_sound
+
+    try:
+        if key.char == "1":
+            right_freq = 1000  # match left -> circle with 90° phase
+            phase_deg = 90
+            play_sound = True
+            print("🎵 Circle (equal freq, 90°)")
+        elif key.char == "2":
+            right_freq = 2000
+            phase_deg = 0
+            play_sound = True
+            print("🎵 Figure-8 (1:2 ratio)")
+        elif key.char == "3":
+            right_freq = 3000
+            phase_deg = 45
+            play_sound = True
+            print("🎵 3-loop")
+        elif key.char == "4":
+            right_freq = 2500
+            phase_deg = 30
+            play_sound = True
+            print("🎵 Star shape")
+        elif key.char == "m":
+            play_sound = not play_sound
+            print("🔇 Muted" if not play_sound else "🔊 Unmuted")
+        elif key.char == "q":
+            print("👋 Exiting...")
+            running = False
+            return False
+    except AttributeError:
+        if key == keyboard.Key.up:
+            right_freq += 100
+            print(f"⬆ Right Frequency = {right_freq} Hz")
+        elif key == keyboard.Key.down:
+            right_freq = max(100, right_freq - 100)
+            print(f"⬇ Right Frequency = {right_freq} Hz")
+        elif key == keyboard.Key.right:
+            phase_deg += 10
+            print(f"➡ Phase = {phase_deg}°")
+        elif key == keyboard.Key.left:
+            phase_deg -= 10
+            print(f"⬅ Phase = {phase_deg}°")
+
+# -------- Helper: get ordered copy of circular buffer (oldest->newest) --------
+def get_buffer_snapshot():
+    with buf_lock:
+        if buf_filled:
+            # oldest sample is at write_idx
+            if write_idx == 0:
+                data = circ_buf.copy()
+            else:
+                data = np.vstack((circ_buf[write_idx:, :], circ_buf[:write_idx, :])).copy()
+        else:
+            data = circ_buf[:write_idx, :].copy()
+    return data
+
+# -------- Run Program (keeps your original run structure, adds plotting) --------
+print("🎛 Lissajous Interactive Program (Fixed Left, Variable Right)")
+print("Controls:")
+print(" ↑ ↓ : Change RIGHT frequency")
+print(" ← → : Change phase")
+print(" 1/2/3/4 : Switch preset shapes")
+print(" m : Mute/Unmute")
+print(" q : Quit")
+print("\n⚠ Waiting for your first key...")
+
+# Matplotlib live plot setup (Right → X, Left → Y to match DSO XY mode)
+plt.ion()
+fig, ax = plt.subplots(figsize=(6,6))
+# continuous line with small linewidth gives a DSO-like trace
+line, = ax.plot([], [], lw=1.2)
+ax.set_xlim(-1.2, 1.2)
+ax.set_ylim(-1.2, 1.2)
+ax.set_xlabel("Right channel (X axis)")
+ax.set_ylabel("Left channel (Y axis)")
+ax.set_title("Lissajous Figure (Laptop View = DSO View)")
+ax.set_aspect('equal', adjustable='box')
+
+# Start audio stream and keyboard listener (same nesting you used)
+with sd.OutputStream(channels=2, callback=audio_callback, samplerate=sample_rate, blocksize=1024, dtype='float32'):
+    with keyboard.Listener(on_press=on_press) as listener:
+        while running:
+            # take a snapshot of full buffer (oldest -> newest)
+            data = get_buffer_snapshot()
+
+            # choose how many recent points to show for density/persistence similar to DSO
+            if data.size == 0:
+                # nothing yet
+                time.sleep(0.01)
+                continue
+
+            N_plot = 8192  # increase for smoother/higher-density trace; reduce if slow
+            if len(data) >= N_plot:
+                plot_data = data[-N_plot:, :]
+            else:
+                plot_data = data
+
+            # Map to DSO XY view: Right -> X, Left -> Y
+            x = plot_data[:, 1]
+            y = plot_data[:, 0]
+
+            # update continuous line (keeps time-order continuity)
+            line.set_xdata(x)
+            line.set_ydata(y)
+
+            # fixed axes so laptop view matches DSO scaling
+            ax.set_xlim(-1.2, 1.2)
+            ax.set_ylim(-1.2, 1.2)
+            ax.set_aspect('equal', adjustable='box')
+
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+            # small sleep to keep ~20-30 FPS
+            time.sleep(0.03)
+
+print("Program ended.")
