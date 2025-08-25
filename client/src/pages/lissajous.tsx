@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Play, Pause, Volume2, VolumeX } from "lucide-react";
 
 interface LissajousPoint {
   x: number;
@@ -31,6 +32,15 @@ export default function LissajousGenerator() {
   const frameCountRef = useRef<number>(0);
   const lastFPSUpdateRef = useRef<number>(Date.now());
 
+  // Audio Web API refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const leftOscillatorRef = useRef<OscillatorNode | null>(null);
+  const rightOscillatorRef = useRef<OscillatorNode | null>(null);
+  const leftGainRef = useRef<GainNode | null>(null);
+  const rightGainRef = useRef<GainNode | null>(null);
+  const pannerRef = useRef<StereoPannerNode | null>(null);
+  const masterGainRef = useRef<GainNode | null>(null);
+
   // Pattern parameters
   const [leftFreq, setLeftFreq] = useState(1000);
   const [rightFreq, setRightFreq] = useState(1000);
@@ -39,6 +49,11 @@ export default function LissajousGenerator() {
   const [trailLength, setTrailLength] = useState(8192);
   const [showGrid, setShowGrid] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
+  
+  // Audio state
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(0.3);
   
   // Display state
   const [fps, setFps] = useState(60);
@@ -233,6 +248,146 @@ export default function LissajousGenerator() {
     setActivePreset(preset.name);
   }, []);
 
+  // Audio functions
+  const initializeAudio = useCallback(() => {
+    if (audioContextRef.current) return;
+
+    try {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      
+      // Create master gain node
+      masterGainRef.current = audioContextRef.current.createGain();
+      masterGainRef.current.gain.value = volume;
+      masterGainRef.current.connect(audioContextRef.current.destination);
+
+    } catch (error) {
+      console.error('Failed to initialize audio context:', error);
+    }
+  }, [volume]);
+
+  const startAudio = useCallback(() => {
+    if (!audioContextRef.current) {
+      initializeAudio();
+    }
+
+    if (!audioContextRef.current || !masterGainRef.current) return;
+
+    try {
+      // Resume context if suspended
+      if (audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume();
+      }
+
+      // Create stereo channel merger
+      const merger = audioContextRef.current.createChannelMerger(2);
+
+      // Create oscillators and gain nodes
+      leftOscillatorRef.current = audioContextRef.current.createOscillator();
+      rightOscillatorRef.current = audioContextRef.current.createOscillator();
+      leftGainRef.current = audioContextRef.current.createGain();
+      rightGainRef.current = audioContextRef.current.createGain();
+
+      // Configure oscillators
+      leftOscillatorRef.current.type = 'sine';
+      rightOscillatorRef.current.type = 'sine';
+      leftOscillatorRef.current.frequency.setValueAtTime(leftFreq, audioContextRef.current.currentTime);
+      rightOscillatorRef.current.frequency.setValueAtTime(rightFreq, audioContextRef.current.currentTime);
+
+      // Configure gain (reduce volume to prevent ear damage)
+      const baseGain = isMuted ? 0 : volume * 0.1;
+      leftGainRef.current.gain.setValueAtTime(baseGain, audioContextRef.current.currentTime);
+      rightGainRef.current.gain.setValueAtTime(baseGain, audioContextRef.current.currentTime);
+
+      // Connect left oscillator to left channel (channel 0)
+      leftOscillatorRef.current.connect(leftGainRef.current);
+      leftGainRef.current.connect(merger, 0, 0);
+
+      // Connect right oscillator to right channel (channel 1)
+      rightOscillatorRef.current.connect(rightGainRef.current);
+      rightGainRef.current.connect(merger, 0, 1);
+
+      // Connect merger to master gain
+      merger.connect(masterGainRef.current);
+
+      // Start oscillators with phase difference
+      const now = audioContextRef.current.currentTime;
+      leftOscillatorRef.current.start(now);
+      rightOscillatorRef.current.start(now);
+
+      setIsPlaying(true);
+    } catch (error) {
+      console.error('Failed to start audio:', error);
+    }
+  }, [leftFreq, rightFreq, phaseDeg, volume, isMuted, initializeAudio]);
+
+  const stopAudio = useCallback(() => {
+    try {
+      if (leftOscillatorRef.current) {
+        leftOscillatorRef.current.stop();
+        leftOscillatorRef.current.disconnect();
+        leftOscillatorRef.current = null;
+      }
+      if (rightOscillatorRef.current) {
+        rightOscillatorRef.current.stop();
+        rightOscillatorRef.current.disconnect();
+        rightOscillatorRef.current = null;
+      }
+      if (leftGainRef.current) {
+        leftGainRef.current.disconnect();
+        leftGainRef.current = null;
+      }
+      if (rightGainRef.current) {
+        rightGainRef.current.disconnect();
+        rightGainRef.current = null;
+      }
+      setIsPlaying(false);
+    } catch (error) {
+      console.error('Failed to stop audio:', error);
+    }
+  }, []);
+
+  const updateAudioParams = useCallback(() => {
+    if (!audioContextRef.current || !isPlaying) return;
+
+    try {
+      // Update frequencies
+      if (leftOscillatorRef.current) {
+        leftOscillatorRef.current.frequency.setValueAtTime(leftFreq, audioContextRef.current.currentTime);
+      }
+      if (rightOscillatorRef.current) {
+        rightOscillatorRef.current.frequency.setValueAtTime(rightFreq, audioContextRef.current.currentTime);
+      }
+
+      // Update gain based on mute and volume
+      const baseGain = isMuted ? 0 : volume * 0.1;
+      if (leftGainRef.current) {
+        leftGainRef.current.gain.setValueAtTime(baseGain, audioContextRef.current.currentTime);
+      }
+      if (rightGainRef.current) {
+        rightGainRef.current.gain.setValueAtTime(baseGain, audioContextRef.current.currentTime);
+      }
+    } catch (error) {
+      console.error('Failed to update audio params:', error);
+    }
+  }, [leftFreq, rightFreq, volume, isMuted, isPlaying]);
+
+  const toggleAudio = useCallback(() => {
+    if (isPlaying) {
+      stopAudio();
+    } else {
+      startAudio();
+    }
+  }, [isPlaying, startAudio, stopAudio]);
+
+  const toggleMute = useCallback(() => {
+    setIsMuted(!isMuted);
+  }, [isMuted]);
+
+  // Update audio parameters when frequencies or volume change
+  useEffect(() => {
+    updateAudioParams();
+  }, [updateAudioParams]);
+
   // Start animation on mount
   useEffect(() => {
     startTimeRef.current = Date.now();
@@ -242,8 +397,14 @@ export default function LissajousGenerator() {
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
+      // Cleanup audio
+      stopAudio();
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
     };
-  }, [render]);
+  }, [render, stopAudio]);
 
   const frequencyRatio = getFrequencyRatio();
   const patternInfo = getPatternInfo();
@@ -297,6 +458,11 @@ export default function LissajousGenerator() {
               <div className="flex items-center space-x-2">
                 <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" data-testid="indicator-realtime"></div>
                 <span className="text-gray-300">Real-time</span>
+              </div>
+              <div className="text-gray-400">|</div>
+              <div className="flex items-center space-x-2">
+                <div className={`w-2 h-2 rounded-full ${isPlaying ? 'bg-cosmic-blue animate-pulse' : 'bg-gray-600'}`} data-testid="indicator-audio"></div>
+                <span className="text-gray-300">{isPlaying ? 'Audio' : 'Silent'}</span>
               </div>
               <div className="text-gray-400">|</div>
               <div className="text-gray-300">
@@ -406,6 +572,84 @@ export default function LissajousGenerator() {
               <span className="text-cosmic-blue font-medium" data-testid="text-phase">{phaseDeg}°</span>
               <span>360°</span>
             </div>
+          </div>
+        </div>
+
+        {/* Audio Controls */}
+        <div className="mb-8">
+          <h3 className="text-lg font-semibold mb-4 text-cosmic-blue" data-testid="title-audio">Audio Control</h3>
+          
+          {/* Play/Pause and Mute */}
+          <div className="flex items-center space-x-3 mb-4">
+            <Button
+              onClick={toggleAudio}
+              variant="ghost"
+              size="sm"
+              className="flex items-center space-x-2 bg-cosmic-gray hover:bg-cosmic-blue hover:text-cosmic-black"
+              data-testid="button-play-pause"
+            >
+              {isPlaying ? (
+                <>
+                  <Pause className="w-4 h-4" />
+                  <span>Pause</span>
+                </>
+              ) : (
+                <>
+                  <Play className="w-4 h-4" />
+                  <span>Play</span>
+                </>
+              )}
+            </Button>
+
+            <Button
+              onClick={toggleMute}
+              variant="ghost"
+              size="sm"
+              className="flex items-center space-x-2 bg-cosmic-gray hover:bg-cosmic-blue hover:text-cosmic-black"
+              data-testid="button-mute"
+            >
+              {isMuted ? (
+                <>
+                  <VolumeX className="w-4 h-4" />
+                  <span>Muted</span>
+                </>
+              ) : (
+                <>
+                  <Volume2 className="w-4 h-4" />
+                  <span>Audio</span>
+                </>
+              )}
+            </Button>
+          </div>
+
+          {/* Volume Control */}
+          <div className="mb-4">
+            <label className="block text-sm font-medium mb-2 text-gray-300">
+              Volume
+            </label>
+            <div className="space-y-2">
+              <Slider
+                value={[volume]}
+                onValueChange={(value) => setVolume(value[0])}
+                min={0}
+                max={1}
+                step={0.1}
+                className="slider-track"
+                data-testid="slider-volume"
+              />
+              <div className="flex justify-between text-xs text-gray-400">
+                <span>Silent</span>
+                <span className="text-cosmic-blue font-medium" data-testid="text-volume">{Math.round(volume * 100)}%</span>
+                <span>Loud</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Audio Info */}
+          <div className="text-xs text-gray-400 space-y-1">
+            <div>Left Channel: <span className="text-cosmic-blue" data-testid="text-audio-left">{leftFreq} Hz</span></div>
+            <div>Right Channel: <span className="text-cosmic-blue" data-testid="text-audio-right">{rightFreq} Hz</span></div>
+            <div>Phase Shift: <span className="text-cosmic-blue" data-testid="text-audio-phase">{phaseDeg}°</span></div>
           </div>
         </div>
 
